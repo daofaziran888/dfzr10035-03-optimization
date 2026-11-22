@@ -17,6 +17,9 @@ class GovernReportService(BaseModuleService):
 
     def run_action(self, entry_id: int, action: str):
         """生成报告时收集跨模块数据；审核时联动管道审计和调用日志。"""
+        existing = store.find(self.MODULE, entry_id)
+        if existing is not None and isinstance(existing.get("fault_scope"), dict):
+            return self._run_fault_report_action(existing, action)
         entry, message = super().run_action(entry_id, action)
         if entry is None:
             return entry, message
@@ -30,6 +33,38 @@ class GovernReportService(BaseModuleService):
             self._snapshot_data_version(entry)
             message += "，已创建数据版本快照"
         return entry, message
+
+    def _run_fault_report_action(self, report: dict, action: str):
+        """采集故障分布取用报告走专用流程，避免通用动作改写其采用范围。"""
+        from app.services.fault_distribution import FaultDistributionService
+
+        service = FaultDistributionService()
+        if action == "归档报告":
+            result = service.archive_report(report.get("报告编号"))
+            if not result.get("ok"):
+                return None, result.get("message", "归档失败")
+            if result.get("duplicate_snapshot_created"):
+                return None, "归档会重复创建快照，已阻止"
+            return result.get("report"), result.get("message", "")
+        if action == "生成报告":
+            result = service.recalculate(report.get("报告编号"))
+            if not result.get("ok"):
+                return None, result.get("message", "复算失败")
+            return result.get("report"), result.get("message", "")
+        if action == "提交审核":
+            if report.get("status") == "已归档":
+                return None, "报告已归档，不能重新提交审核"
+            pending = [
+                correction for correction in service.report_fault_corrections(report)
+                if correction.get("状态") == "待应用"
+            ]
+            if pending:
+                return None, f"还有{len(pending)}条等待中的更正未进入报告，请先复算"
+            report["status"] = "已审核"
+            report["pending"] = True
+            self._audit_report(report)
+            return report, "治理报告已提交审核，已记录审计并写入调用日志"
+        return None, f"动作「{action}」不属于采集故障分布取用报告可执行范围"
 
     def _collect_cross_module_data(self, report: dict):
         """生成报告时采集跨模块统计。"""
@@ -90,7 +125,9 @@ class GovernReportService(BaseModuleService):
         })
 
     def _snapshot_data_version(self, report: dict):
-        """归档时创建数据版本快照。"""
+        """归档时创建数据版本快照；故障分布报告的归档由领域服务幂等处理。"""
+        if isinstance(report.get("fault_scope"), dict):
+            return
         ver_rows = store.rows("data_version")
         rid = str(report["id"]).zfill(4)
         ver_rows.append({
@@ -108,9 +145,15 @@ class GovernReportService(BaseModuleService):
 
     def calc_govern_score(self) -> dict:
         """跨模块治理全景评分。"""
+        from app.services.fault_distribution import FaultDistributionService
+
+        fault_overview = FaultDistributionService().overview()
         return {
             "reports_total": len(store.rows("govern_report")),
             "reports_pending": sum(1 for r in store.rows("govern_report") if r.get("status") == "待生成"),
+            "fault_reports": fault_overview["reports_total"],
+            "fault_reports_archived": fault_overview["reports_archived"],
+            "fault_corrections_pending": fault_overview["corrections_pending"],
             "audits_open": sum(1 for a in store.rows("pipeline_audit") if a.get("status") == "待复核"),
             "data_versions": len(store.rows("data_version")),
             "call_anomalies": sum(1 for c in store.rows("call_log") if c.get("abnormal")),

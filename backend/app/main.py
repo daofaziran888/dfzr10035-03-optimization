@@ -195,6 +195,11 @@ def chain_snapshot():
     return {"modules": results, "total_modules": len(results)}
 
 
+# 采集故障时间分布接口含 /api/fault-distribution/*，同样要在动态资源路由之前注册。
+from app.routers import fault_distribution as fault_distribution_router  # noqa: E402
+
+app.include_router(fault_distribution_router.router)
+
 # 资源路由含 /api/{module}，必须放在 health / overview 及 chain 接口之后注册，
 # 否则固定路径会被动态路径抢先匹配。
 for module in ROUTERS:
